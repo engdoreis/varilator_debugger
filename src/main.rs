@@ -1,12 +1,16 @@
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{self, BufRead};
 use std::process;
+use regex::Regex;
 
 const DEFAULT_ERROR: &str = "    Not found\n";
 
 #[derive(Debug)]
 struct Config{
     addr2line_path: String,
+    readelf_path: String,
     elf_file : String,
     log_file : String,
     output_file : String,
@@ -30,6 +34,7 @@ impl DebuggerVarilator {
     fn new(addr2line_path: &str, elf_file : &str, log_file : &str, out_file : &str) -> DebuggerVarilator{
        let config = Config{
             addr2line_path: addr2line_path.to_string(),
+            readelf_path: addr2line_path.to_string().replace("addr2line", "readelf"),
             elf_file: elf_file.to_string(),
             log_file: log_file.to_string(),
             output_file: out_file.to_string()
@@ -125,6 +130,71 @@ impl DebuggerVarilator {
             _ => String::from(DEFAULT_ERROR)
         }
     }
+
+     /**
+     * Load the log file content filtering out the lines with addresses out of the specified range.
+     * 
+     * @param start_addr: Range start address.
+     * @param end_addr: Range end address.
+     * @return a String with the file content, string error otherwise.
+     */
+    fn get_file_content(&mut self, start_addr:u32, end_addr:u32) -> Result<String, String>{
+        let address_re = Regex::new(r"[\da-fA-F]+\s+[\da-fA-F]+\s+([\da-fA-F]+)\s+[\da-fA-F]+\s+\w+").unwrap();
+        let mut res = String::from("");
+        if let Ok(file) = File::open(&self.config.log_file){
+            for line in io::BufReader::new(file).lines(){
+                if let Ok(l) = line {
+                    if let Some(cap) = address_re.captures(&l) {
+                        let addr = u32::from_str_radix(&cap[1], 16).unwrap();
+                        if start_addr < addr && end_addr > addr{
+                            res += &(l + "\n");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(res)
+   }
+
+
+     /**
+     * Read the elf and return the start address and the size.
+     * 
+     * @return a tuple with the address and size and string error otherwise.
+     */
+   fn get_elf_addr_and_size(&mut self) -> Result<(u32,u32), String>{
+       let res =  match process::Command::new(&self.config.readelf_path)
+        .arg("-l")
+        .arg(&self.config.elf_file)
+        .output(){
+            Ok(res) => res,
+            _ => return Err(String::from("Failed to execute readelf"))
+        };
+
+        let res = match String::from_utf8(res.stdout){
+            Ok(res) => res,
+            _ => return Err(String::from("Failed to execute readelf"))
+        };
+
+         // Regex to parse the readelf -l output.
+        let entry_point_re = Regex::new(r"Entry point\s0x([\da-fA-F]+)").unwrap();
+        let load_re = Regex::new(r"LOAD\s+0x[\da-fA-F]+\s+0x[\da-fA-F]+\s+0x([\da-fA-F]+)\s+0x([\da-fA-F]+)\s+0x[\da-fA-F]+\s+").unwrap();
+        let mut start_addr = std::u32::MAX;
+        let mut size: u32 = 0;
+        for line in res.lines(){
+            if let Some(cap) = entry_point_re.captures(line) {
+                start_addr = u32::from_str_radix(&cap[1], 16).unwrap(); 
+            }
+            else if let Some(cap) = load_re.captures(line) {
+               let addr:u32 = u32::from_str_radix(&cap[1], 16).unwrap(); 
+               size = u32::from_str_radix(&cap[2], 16).unwrap(); 
+               if addr == start_addr & 0xFFFF0000 {
+                   break;
+               }
+            }
+        }
+        Ok((start_addr, size))
+   }
     
     /**
      * Process the log file by iterating through all lines.
@@ -132,7 +202,10 @@ impl DebuggerVarilator {
     fn run (&mut self) -> std::io::Result<()> {
         println!("Starting ...");
         let mut last_src_line = "".to_string();
-        let log_content = fs::read_to_string(&self.config.log_file).expect("Error to open the file");
+
+        let (start_addr, size)  = self.get_elf_addr_and_size().expect("Error to get elf Address");
+        let log_content = self.get_file_content(start_addr, start_addr + size).expect("Error to open the file");
+        // let log_content = fs::read_to_string(&self.config.log_file).expect("Error to open the file");
         let total = log_content.lines().count();
         println!("File {} imported successfully", self.config.log_file);
         println!("Parsing it...");
