@@ -111,24 +111,18 @@ impl DebuggerVarilator {
             Some(name) => name,
             None => return String::from(DEFAULT_ERROR),
         };
-        let line_number = line_number.trim_end_matches('\n').parse::<u32>();
+        let line_number = line_number.trim_end_matches('\n').parse::<usize>();
 
-        match line_number {
-            Ok(number) => {
-                let sed_exp = format!("{}!d", &number);
-        
-                let res = process::Command::new("sed")
-                        .arg(&sed_exp)
-                        .arg(&filename)
-                        .output()
-                        .expect("Failed to execute cat");
-        
-                let mut res = String::from_utf8(res.stdout).unwrap().trim_start().to_string();
-                res.insert_str( 0, "    ");
-                res
+        if let Ok(number) = line_number {
+            if let Ok(file) = File::open(&filename){
+                for line in io::BufReader::new(file).lines().skip(number - 1){
+                    if let Ok(l) = line {
+                        return "    ".to_owned() + &l + "\n";
+                    }
+                }
             }
-            _ => String::from(DEFAULT_ERROR)
         }
+        String::from(DEFAULT_ERROR)
     }
 
      /**
