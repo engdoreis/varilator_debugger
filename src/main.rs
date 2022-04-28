@@ -1,12 +1,16 @@
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{self, BufRead};
 use std::process;
+use regex::Regex;
 
 const DEFAULT_ERROR: &str = "    Not found\n";
 
 #[derive(Debug)]
 struct Config{
     addr2line_path: String,
+    readelf_path: String,
     elf_file : String,
     log_file : String,
     output_file : String,
@@ -30,6 +34,7 @@ impl DebuggerVarilator {
     fn new(addr2line_path: &str, elf_file : &str, log_file : &str, out_file : &str) -> DebuggerVarilator{
        let config = Config{
             addr2line_path: addr2line_path.to_string(),
+            readelf_path: addr2line_path.to_string().replace("addr2line", "readelf"),
             elf_file: elf_file.to_string(),
             log_file: log_file.to_string(),
             output_file: out_file.to_string()
@@ -73,22 +78,20 @@ impl DebuggerVarilator {
     /**
      * Parse a log line to get the address and call the addr2line to return the source file.
      * 
-     * @param disassembly_line: A string with a line from the log. 
+     * @param addresses: A list of addresses in hex string format. i.e. 200040f0. 
+     * @return A list of strings with the corresponding addresses.
      */
-    fn get_src_file(&mut self, disassembly_line: &str) -> String {
-        let address = match disassembly_line.split_whitespace().skip(2).next() {
-            Some(addr) => addr,
-            None => return String::from(DEFAULT_ERROR),
-        };
+    fn get_src_file(&mut self, addresses: &Vec<&str>) -> Vec<String> {
+ 
+        let mut ps = process::Command::new(&self.config.addr2line_path);
+        ps.arg("-e").arg(&self.config.elf_file);
+        for addr in addresses{
+            ps.arg(addr.to_string());
+        }
+            
+        let res = ps.output().expect("Failed to execute addr2line");
 
-        let res = process::Command::new(&self.config.addr2line_path)
-            .arg("-e")
-            .arg(&self.config.elf_file)
-            .arg(&address)
-            .output()
-            .expect("Failed to execute addr2line");
-
-        String::from_utf8(res.stdout).expect("stdout parsing error")
+        String::from_utf8(res.stdout).expect("stdout parsing error").lines().map(|l| l.to_string()).collect()
     }
 
     /**
@@ -96,7 +99,7 @@ impl DebuggerVarilator {
      * 
      * @param src_info: addr2line output in the format <path/to/source>:<line>. 
      */
-    fn get_src_line(&mut self, src_info: &str) -> String {
+    fn get_src_location(&mut self, src_info: &str) -> String {
         let mut it = src_info.split(':');
         let filename = match it.next() {
             Some(name) => name,
@@ -106,55 +109,141 @@ impl DebuggerVarilator {
             Some(name) => name,
             None => return String::from(DEFAULT_ERROR),
         };
-        let line_number = line_number.trim_end_matches('\n').parse::<u32>();
+        let line_number = line_number.trim_end_matches('\n').parse::<usize>();
 
-        match line_number {
-            Ok(number) => {
-                let sed_exp = format!("{}!d", &number);
-        
-                let res = process::Command::new("sed")
-                        .arg(&sed_exp)
-                        .arg(&filename)
-                        .output()
-                        .expect("Failed to execute cat");
-        
-                let mut res = String::from_utf8(res.stdout).unwrap().trim_start().to_string();
-                res.insert_str( 0, "    ");
-                res
+        if let Ok(number) = line_number {
+            if let Ok(file) = File::open(&filename){
+                for line in io::BufReader::new(file).lines().skip(number - 1){
+                    if let Ok(l) = line {
+                        return "    ".to_owned() + &l + "\n";
+                    }
+                }
             }
-            _ => String::from(DEFAULT_ERROR)
         }
+        String::from(DEFAULT_ERROR)
     }
+
+     /**
+     * Load the log file content filtering out the lines with addresses out of the specified range.
+     * 
+     * @param start_addr: Range start address.
+     * @param end_addr: Range end address.
+     * @return a String with the file content, string error otherwise.
+     */
+    fn get_file_content(&mut self, start_addr:u32, end_addr:u32) -> Result<String, String>{
+        let address_re = Regex::new(r"[\da-fA-F]+\s+[\da-fA-F]+\s+([\da-fA-F]+)\s+[\da-fA-F]+\s+\w+").unwrap();
+        let mut res = String::from("");
+        if let Ok(file) = File::open(&self.config.log_file){
+            for line in io::BufReader::new(file).lines(){
+                if let Ok(l) = line {
+                    if let Some(cap) = address_re.captures(&l) {
+                        let addr = u32::from_str_radix(&cap[1], 16).unwrap();
+                        if start_addr < addr && end_addr > addr{
+                            res += &(l + "\n");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(res)
+   }
+
+
+     /**
+     * Read the elf and return the start address and the size.
+     * 
+     * @return a tuple with the address and size and string error otherwise.
+     */
+   fn get_elf_addr_and_size(&mut self) -> Result<(u32,u32), String>{
+       let res =  match process::Command::new(&self.config.readelf_path)
+        .arg("-l")
+        .arg(&self.config.elf_file)
+        .output(){
+            Ok(res) => res,
+            _ => return Err(String::from("Failed to execute readelf"))
+        };
+
+        let res = match String::from_utf8(res.stdout){
+            Ok(res) => res,
+            _ => return Err(String::from("Failed to execute readelf"))
+        };
+
+         // Regex to parse the readelf -l output.
+        let entry_point_re = Regex::new(r"Entry point\s0x([\da-fA-F]+)").unwrap();
+        let load_re = Regex::new(r"LOAD\s+0x[\da-fA-F]+\s+0x[\da-fA-F]+\s+0x([\da-fA-F]+)\s+0x([\da-fA-F]+)\s+0x[\da-fA-F]+\s+").unwrap();
+        let mut start_addr = std::u32::MAX;
+        let mut size: u32 = 0;
+        for line in res.lines(){
+            if let Some(cap) = entry_point_re.captures(line) {
+                start_addr = u32::from_str_radix(&cap[1], 16).unwrap(); 
+            }
+            else if let Some(cap) = load_re.captures(line) {
+               let addr:u32 = u32::from_str_radix(&cap[1], 16).unwrap(); 
+               size = u32::from_str_radix(&cap[2], 16).unwrap(); 
+               if addr == start_addr & 0xFFFF0000 {
+                   break;
+               }
+            }
+        }
+        Ok((start_addr, size))
+   }
     
     /**
      * Process the log file by iterating through all lines.
      */
     fn run (&mut self) -> std::io::Result<()> {
         println!("Starting ...");
-        let mut last_src_line = "".to_string();
-        let log_content = fs::read_to_string(&self.config.log_file).expect("Error to open the file");
+        
+        let (start_addr, size)  = self.get_elf_addr_and_size().expect("Error to get elf Address");
+        let log_content = self.get_file_content(start_addr, start_addr + size).expect("Error to open the file");
+        // let log_content = fs::read_to_string(&self.config.log_file).expect("Error to open the file");
         let total = log_content.lines().count();
         println!("File {} imported successfully", self.config.log_file);
         println!("Parsing it...");
-
+        
+        let mut line_list: Vec<&str> = Vec::new();
+        let mut addr_list: Vec<&str> = Vec::new();
+        let mut last_addr: u32 = 0;
         for (count, line) in log_content.lines().enumerate() {
+            
+            let address = match line.split_whitespace().skip(2).next() {
+                Some(addr) => addr,
+                None => continue
+            };
+            line_list.push(line);
+            addr_list.push(address);
 
-            let src_file = self.get_src_file(line);
-            // Skip this search if the current log line represents the same source line.
-            if last_src_line != src_file {
-                self.output.push_str("\n");
-
-                let c_src_line = self.get_src_line(&src_file);
-
-                self.output.push_str(&src_file);
-                self.output.push_str(&c_src_line);
+            // If the current address is in the sequency of the last address, then keep pushing in the stack.
+            // Otherwise process the addresses in the stack.
+            let address =  u32::from_str_radix(address, 16).unwrap_or(0);
+            if last_addr.abs_diff(address) <= 4{
+                last_addr = address;
+                continue;
             }
+            last_addr = address;
+            
+            let src_file_list = self.get_src_file(&addr_list);
+            // Skip this search if the current log line represents the same source line.
+            let mut last_src_location = "";
+            for (src_file, line) in src_file_list.iter().zip(line_list.iter()){
+                
+                if !last_src_location.eq(src_file) {
+                    self.output.push_str("\n");
+                    let src_code = self.get_src_location(&src_file);
+                    self.output.push_str(&src_file);
+                    self.output.push_str("\n");
+                
+                    self.output.push_str(&src_code);
+                }
+                self.output.push_str(line);
+                self.output.push_str("\n");
+                last_src_location = src_file;
+            }
+            
+            addr_list.clear();
+            line_list.clear();
 
-            self.output.push_str(line);
-            self.output.push_str("\n");
-            last_src_line = src_file;
-
-            print!("\rProgress:  {}%", count*100/total);
+            print!("\rProgress:  {}%", count * 100 / total);
         }
         // Processing has finished, write the result to the output file.
         fs::write(&self.config.output_file, &self.output)?;
