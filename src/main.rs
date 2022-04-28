@@ -78,22 +78,20 @@ impl DebuggerVarilator {
     /**
      * Parse a log line to get the address and call the addr2line to return the source file.
      * 
-     * @param disassembly_line: A string with a line from the log. 
+     * @param addresses: A list of addresses in hex string format. i.e. 200040f0. 
+     * @return A list of strings with the corresponding addresses.
      */
-    fn get_src_file(&mut self, disassembly_line: &str) -> String {
-        let address = match disassembly_line.split_whitespace().skip(2).next() {
-            Some(addr) => addr,
-            None => return String::from(DEFAULT_ERROR),
-        };
+    fn get_src_file(&mut self, addresses: &Vec<&str>) -> Vec<String> {
+ 
+        let mut ps = process::Command::new(&self.config.addr2line_path);
+        ps.arg("-e").arg(&self.config.elf_file);
+        for addr in addresses{
+            ps.arg(addr.to_string());
+        }
+            
+        let res = ps.output().expect("Failed to execute addr2line");
 
-        let res = process::Command::new(&self.config.addr2line_path)
-            .arg("-e")
-            .arg(&self.config.elf_file)
-            .arg(&address)
-            .output()
-            .expect("Failed to execute addr2line");
-
-        String::from_utf8(res.stdout).expect("stdout parsing error")
+        String::from_utf8(res.stdout).expect("stdout parsing error").lines().map(|l| l.to_string()).collect()
     }
 
     /**
@@ -101,7 +99,7 @@ impl DebuggerVarilator {
      * 
      * @param src_info: addr2line output in the format <path/to/source>:<line>. 
      */
-    fn get_src_line(&mut self, src_info: &str) -> String {
+    fn get_src_location(&mut self, src_info: &str) -> String {
         let mut it = src_info.split(':');
         let filename = match it.next() {
             Some(name) => name,
@@ -195,33 +193,57 @@ impl DebuggerVarilator {
      */
     fn run (&mut self) -> std::io::Result<()> {
         println!("Starting ...");
-        let mut last_src_line = "".to_string();
-
+        
         let (start_addr, size)  = self.get_elf_addr_and_size().expect("Error to get elf Address");
         let log_content = self.get_file_content(start_addr, start_addr + size).expect("Error to open the file");
         // let log_content = fs::read_to_string(&self.config.log_file).expect("Error to open the file");
         let total = log_content.lines().count();
         println!("File {} imported successfully", self.config.log_file);
         println!("Parsing it...");
-
+        
+        let mut line_list: Vec<&str> = Vec::new();
+        let mut addr_list: Vec<&str> = Vec::new();
+        let mut last_addr: u32 = 0;
         for (count, line) in log_content.lines().enumerate() {
+            
+            let address = match line.split_whitespace().skip(2).next() {
+                Some(addr) => addr,
+                None => continue
+            };
+            line_list.push(line);
+            addr_list.push(address);
 
-            let src_file = self.get_src_file(line);
-            // Skip this search if the current log line represents the same source line.
-            if last_src_line != src_file {
-                self.output.push_str("\n");
-
-                let c_src_line = self.get_src_line(&src_file);
-
-                self.output.push_str(&src_file);
-                self.output.push_str(&c_src_line);
+            // If the current address is in the sequency of the last address, then keep pushing in the stack.
+            // Otherwise process the addresses in the stack.
+            let address =  u32::from_str_radix(address, 16).unwrap_or(0);
+            if last_addr.abs_diff(address) <= 4{
+                last_addr = address;
+                continue;
             }
+            last_addr = address;
+            
+            let src_file_list = self.get_src_file(&addr_list);
+            // Skip this search if the current log line represents the same source line.
+            let mut last_src_location = "";
+            for (src_file, line) in src_file_list.iter().zip(line_list.iter()){
+                
+                if !last_src_location.eq(src_file) {
+                    self.output.push_str("\n");
+                    let src_code = self.get_src_location(&src_file);
+                    self.output.push_str(&src_file);
+                    self.output.push_str("\n");
+                
+                    self.output.push_str(&src_code);
+                }
+                self.output.push_str(line);
+                self.output.push_str("\n");
+                last_src_location = src_file;
+            }
+            
+            addr_list.clear();
+            line_list.clear();
 
-            self.output.push_str(line);
-            self.output.push_str("\n");
-            last_src_line = src_file;
-
-            print!("\rProgress:  {}%", count*100/total);
+            print!("\rProgress:  {}%", count * 100 / total);
         }
         // Processing has finished, write the result to the output file.
         fs::write(&self.config.output_file, &self.output)?;
